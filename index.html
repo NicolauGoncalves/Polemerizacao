@@ -742,24 +742,57 @@
 
         // Gemini TTS integration with American English voice (Zephyr)
         async function speakCurrentSentence() {
+            const btnRead = document.getElementById('btn-read-sentence');
+            if (btnRead.disabled) return; // Prevent multiple clicks
+
             const data = levelData[currentLevel];
             // Check if blank has already been filled in by the player
             const targetBlank = document.getElementById('target-blank');
             const isFilled = targetBlank && targetBlank.classList.contains('filled');
-            const wordForBlank = isFilled ? targetBlank.textContent : "blank";
-
-            // Reconstruct sentence replacing 'blank' without revealing the answer in advance
-            const fullSentence = data.sentenceParts.map(part => part === 'blank' ? wordForBlank : part).join(' ');
             
-            const btnRead = document.getElementById('btn-read-sentence');
             const originalHTML = btnRead.innerHTML;
             btnRead.innerHTML = `<i class="fas fa-spinner fa-spin text-amber-600 text-lg"></i> Speaking...`;
             btnRead.disabled = true;
 
-            try {
+            // Cancel any ongoing speech
+            if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+
+            let partsToSpeak = [];
+            if (isFilled) {
+                // If already filled, read normally without extra pauses
+                const fullText = data.sentenceParts.map(part => part === 'blank' ? targetBlank.textContent : part).join(' ');
+                partsToSpeak.push({ text: fullText, delay: 0 });
+            } else {
+                // If not filled, separate chunks and add a 4-second delay where the blank is
+                let currentText = "";
+                data.sentenceParts.forEach((part) => {
+                    if (part === 'blank') {
+                        if (currentText.trim()) {
+                            partsToSpeak.push({ text: currentText.trim(), delay: 4000 });
+                        }
+                        currentText = "";
+                    } else {
+                        currentText += (currentText ? " " : "") + part;
+                    }
+                });
+                if (currentText.trim()) {
+                    partsToSpeak.push({ text: currentText.trim(), delay: 0 });
+                }
+            }
+
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+
+            async function getAudioForText(text) {
+                if (!apiKey) throw new Error("No API key"); // Force fallback immediately
+                
+                // Remove punctuation that might sound weird alone, like "." or ","
+                const cleanText = text.replace(/^[.,;:!?]+$/, '').trim();
+                if (!cleanText) return null; // Skip generating audio for pure punctuation
+
                 const payload = {
                     contents: [{
-                        parts: [{ text: `Say clearly in American English accent with an enthusiastic teacher voice for children: ${fullSentence}` }]
+                        parts: [{ text: `Say clearly in American English accent with an enthusiastic teacher voice for children: ${cleanText}` }]
                     }],
                     generationConfig: {
                         responseModalities: ["AUDIO"],
@@ -771,8 +804,6 @@
                     },
                     model: "gemini-2.5-flash-preview-tts"
                 };
-                const apiKey = "";
-                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
                 
                 const response = await fetch(apiUrl, {
                     method: 'POST',
@@ -790,28 +821,102 @@
                     const pcmData = base64ToArrayBuffer(audioData);
                     const pcm16 = new Int16Array(pcmData);
                     const wavBlob = pcmToWav(pcm16, sampleRate);
-                    const audioUrl = URL.createObjectURL(wavBlob);
-                    
-                    const audio = new Audio(audioUrl);
-                    audio.onended = () => {
-                        btnRead.innerHTML = originalHTML;
-                        btnRead.disabled = false;
-                    };
-                    audio.play();
+                    return URL.createObjectURL(wavBlob);
                 } else {
                     throw new Error("Invalid audio response");
                 }
-            } catch (err) {
-                // Fallback to browser SpeechSynthesis if TTS API fails
-                if ('speechSynthesis' in window) {
-                    const utterance = new SpeechSynthesisUtterance(fullSentence);
-                    utterance.lang = 'en-US';
-                    utterance.rate = 0.9;
-                    utterance.onend = () => {
+            }
+
+            try {
+                // Pre-fetch all audio files if API key is provided
+                let audios = [];
+                if (apiKey) {
+                    for (const p of partsToSpeak) {
+                        const audioUrl = await getAudioForText(p.text);
+                        audios.push(audioUrl);
+                    }
+                } else {
+                    throw new Error("Using fallback");
+                }
+
+                // Play fetched audios sequentially with specified delays
+                let i = 0;
+                function playNext() {
+                    if (i >= partsToSpeak.length) {
                         btnRead.innerHTML = originalHTML;
                         btnRead.disabled = false;
+                        return;
+                    }
+                    
+                    const currentDelay = partsToSpeak[i].delay;
+                    const audioUrl = audios[i];
+
+                    if (!audioUrl) {
+                        // Skip playing audio if it was null (e.g. just punctuation)
+                        setTimeout(() => {
+                            i++;
+                            playNext();
+                        }, currentDelay);
+                        return;
+                    }
+
+                    const audio = new Audio(audioUrl);
+                    audio.onended = () => {
+                        setTimeout(() => {
+                            i++;
+                            playNext();
+                        }, currentDelay);
                     };
-                    window.speechSynthesis.speak(utterance);
+                    audio.play().catch(() => {
+                        i++;
+                        playNext();
+                    });
+                }
+                playNext();
+
+            } catch (err) {
+                // Fallback to browser SpeechSynthesis if TTS API fails or key is missing
+                if ('speechSynthesis' in window) {
+                    let i = 0;
+                    function speakNextFallback() {
+                        if (i >= partsToSpeak.length) {
+                            btnRead.innerHTML = originalHTML;
+                            btnRead.disabled = false;
+                            return;
+                        }
+
+                        const currentChunk = partsToSpeak[i];
+                        const cleanText = currentChunk.text.replace(/^[.,;:!?]+$/, '').trim();
+
+                        if (!cleanText) {
+                            setTimeout(() => {
+                                i++;
+                                speakNextFallback();
+                            }, currentChunk.delay);
+                            return;
+                        }
+
+                        const utterance = new SpeechSynthesisUtterance(cleanText);
+                        utterance.lang = 'en-US';
+                        utterance.rate = 0.9;
+                        
+                        utterance.onend = () => {
+                            setTimeout(() => {
+                                i++;
+                                speakNextFallback();
+                            }, currentChunk.delay);
+                        };
+
+                        utterance.onerror = () => {
+                            setTimeout(() => {
+                                i++;
+                                speakNextFallback();
+                            }, currentChunk.delay);
+                        };
+
+                        window.speechSynthesis.speak(utterance);
+                    }
+                    speakNextFallback();
                 } else {
                     btnRead.innerHTML = originalHTML;
                     btnRead.disabled = false;
